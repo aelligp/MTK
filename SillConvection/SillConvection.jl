@@ -171,13 +171,19 @@ function init_T!(
             T[i + 1, j + 1] = host_rock_temp
         end
         if (sill_top + 10 < depth ≤ sill_top + 20) && ((dimensions[1] / 2 - 5) < x[i] ≤  (dimensions[1] / 2 + 5))
-            T[i + 1, j + 1] = sill_temp + 75
+            T[i + 1, j + 1] = sill_temp + 150
         end
         return nothing
     end
 
-    ni = size(T) .- 2
-    @parallel (@idx ni) _init_T!(T, host_rock_temp, sill_temp, dimensions, sill_size, grid..., perturbation_amplitude, wavelength, bottom_pertubation)
+    nx, ny = size(T) .- 2
+    @parallel (1:nx, 1:ny) _init_T!(T, host_rock_temp, sill_temp, dimensions, sill_size, grid..., perturbation_amplitude, wavelength, bottom_pertubation)
+
+    # Depth (top/bottom) ghost columns have no no_flux BC applied to them later,
+    # so extrapolate them here; the left/right ghost rows are handled by the
+    # subsequent thermal_bcs! call.
+    @views T[:, 1]   .= T[:, 2]
+    @views T[:, end] .= T[:, end - 1]
 
 end
 
@@ -202,9 +208,11 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
     oxd_wt_sill       = (70.78, 0.55, 15.86, 3.93, 1.11, 1.20, 2.54, 3.84, 3.0)
     oxd_wt_host_rock  = (75.75, 0.28, 12.48, 2.14, 0.09, 0.48, 3.53, 5.19, 3.0)
 
-    rheology = init_rheologies(oxd_wt_sill, oxd_wt_host_rock; scaling = 1e4Pas, magma = true)
+    # rheology = init_rheologies(oxd_wt_sill, oxd_wt_host_rock; scaling = 1e4Pas, magma = false)
+    rheology = init_rheologies(oxd_wt_sill, oxd_wt_host_rock; scaling = 1e2Pas, magma = true)
     dt_time = 1.0 * 3600 * 24 * 365
-    κ            = (4 / (1050 * mean(rheology[1].Density[1].Rho.coefs)))
+    # κ            = (4 / (1050 * mean(rheology[1].Density[1].Rho.coefs)))
+    κ            = (4 / (1050 * mean(rheology[1].Density[1].ρ)))
     dt_diff = 0.5 * min(di...)^2 / κ / 2.01
     dt = min(dt_time, dt_diff)
     # ----------------------------------------------------
@@ -218,12 +226,11 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
     phase_ratios = PhaseRatios(backend_JP, length(rheology), ni);
     init_sill!(phases_dev, li, sill_size, xci; perturbation_amplitude = 2.0, wavelength = 100.0, bottom_pertubation = true)
 
-    phase_sill = @zeros(ni...) # initialize phase_sill array
-    phase_host = @zeros(ni...) # initialize phase_host array
-    @views phase_sill[phases_dev .== 2.0] .= 1.0 # set the blob to 1.0 where phases == 2.0
-    @views phase_host[phases_dev .== 1.0] .= 1.0 # set the blob to 1.0 where phases == 2.0
-    clamp!(phase_sill, 0.0, 1.0) # clamp
-    clamp!(phase_host, 0.0, 1.0) # clamp phase_host to 0.0 and 1.0
+    # Sill and host partition the domain: mark the sill (phase 2), take the host
+    # as its complement so the two markers sum to 1 in every cell.
+    phase_sill = @zeros(ni...)
+    @views phase_sill[phases_dev .== 2.0] .= 1.0
+    phase_host = 1.0 .- phase_sill
     update_phase_ratios_2D!(phase_ratios, (phase_host, phase_sill), xci, xvi)
 
     # STOKES ---------------------------------------------
@@ -251,6 +258,9 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
     # Buoyancy force
     ρg = @zeros(ni...), @zeros(ni...)                      # ρg[1] is the buoyancy force in the x direction, ρg[2] is the buoyancy force in the y direction
 
+    # Positive seed so the RedlichKwong gas EOS in ThreePhase_Density is valid on
+    # the first density eval; init_P! overwrites this below.
+    stokes.P .= 1.0e6
     for _ in 1:5
         compute_ρg!(ρg[end], phase_ratios, rheology, (T=thermal.T, P=stokes.P))
         @parallel init_P!(stokes.P, ρg[2], xci[2])
@@ -259,9 +269,28 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
         stokes.P .+= pressure_offset
     end
     # Rheology
+    mH2O = @fill(oxd_wt_sill[9]/100, ni)          # bulk (total) H2O mass fraction
+
+    # Volatile solubility & three-phase coupling. mH2O is the bulk (advected,
+    # conserved) water; the melt holds up to the solubility mH2O_diss per unit
+    # melt mass, so the bulk capacity is mH2O_diss*ϕ and crystallization (falling
+    # ϕ) drives exsolution even at fixed P,T — second boiling. The exsolved gas
+    # occupies a volume fraction ϕ_gas that lowers the ThreePhase_Density mixture.
+    mH2O_diss = @zeros(ni...)                      # H2O solubility (per melt mass)
+    mCO2_diss = @zeros(ni...)
+    mH2O_exs  = @zeros(ni...)                      # exsolved gas mass fraction (of bulk)
+    mH2O_melt = copy(mH2O)                         # dissolved water fed to melt/density
+    X_co2     = @zeros(ni...)                      # pure-water system: no CO2 in the gas
+    ϕ_gas     = @zeros(ni...)                      # exsolved-gas volume fraction
+    ϕ_x       = @zeros(ni...)                      # crystal volume fraction
+    ρ_gas     = @zeros(ni...)                      # H2O gas density (EOS), for mass->volume
+    gas_eos   = RedlichKwong_Density()             # H2O gas EOS for the ϕ_gas conversion
+    _ρgas(P, T) = compute_density(gas_eos, (; P, T))
+
     compute_melt_fraction!(
-        ϕ, phase_ratios, rheology, (T=thermal.T, P=stokes.P)
+        ϕ, phase_ratios, rheology, (T=thermal.T, P=stokes.P, mH2O = mH2O)
     )
+    @. ϕ_x = 1 - ϕ                                 # gas is still zero here
     compute_viscosity!(
         stokes, phase_ratios, args, rheology, cutoff_visc
     )
@@ -329,28 +358,67 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
     time_vec = Float64[0.0]
     d18O_evo = Float64[5.5]
     melt_fraction_evo = Float64[1.0]
+    viscosity_evo = Float64[mean(stokes.viscosity.η[ϕ .> 0.2])]
+    mH2O_diss_evo = Float64[0.0]   # mH2O_diss is still zero at t=0 (not yet computed)
+    mH2O_exs_evo  = Float64[0.0]
+
+    # Snapshot times for the temperature-field checkpoints, as fractions of the
+    # run-time cap used in the `while` condition below.
+    snapshot_targets = sort(collect((0.1, 0.5, 0.9)) .* (650 * 3600 * 24 * 365))
+
+    dyrel = DYREL(backend, stokes, rheology, phase_ratios, grid.di, dt; ϵ = 1.0e-5)
 
     while it < 100e3 && round(maximum(ϕ), digits=2) > 0.3 && t < (650 * 3600 * 24 * 365)
 
-        args = (; ϕ= ϕ,T = thermal.T, P = stokes.P, dt = dt)
-        compute_ρg!(ρg[end], phase_ratios, rheology, (T = thermal.T, P = stokes.P))
+        args = (; ϕ= ϕ,T = thermal.T, P = stokes.P, dt = dt, mH2O = mH2O_melt)
+        # Density sees the dissolved water and the exsolved-gas / crystal volume
+        # fractions from the previous step (ϕ_gas, ϕ_x lagged one iteration).
+        compute_ρg!(ρg[end], phase_ratios, rheology, (; T = thermal.T, P = stokes.P, mH2O = mH2O_melt, ϕ_gas, ϕ_x))
         # ------------------------------
 
-        # Stokes solver ----------------
-        solve!(
+        # # Stokes solver ----------------
+        # solve!(
+        #     stokes,
+        #     pt_stokes,
+        #     grid,
+        #     flow_bcs,
+        #     ρg,
+        #     phase_ratios,
+        #     rheology,
+        #     args,
+        #     Inf,
+        #     igg;
+        #     kwargs = (;
+        #         iterMax = 50.0e3,
+        #         nout = 2.0e3,
+        #         viscosity_cutoff = cutoff_visc,
+        #     )
+        # )
+        solve_DYREL!(
             stokes,
-            pt_stokes,
-            grid,
-            flow_bcs,
             ρg,
+            dyrel,
+            flow_bcs,
             phase_ratios,
             rheology,
             args,
-            Inf,
+            grid,
+            dt,
             igg;
             kwargs = (;
-                iterMax = 50.0e3,
-                nout = 2.0e3,
+                verbose_PH = true,
+                verbose_DR = false,
+                iterMax = 150.0e3,
+                nout = 100,
+                # verbose_PH = true,
+                # verbose_DR = false,
+                # iterMax = 50.0e3,
+                # nout = 50,
+                # rel_drop = 0.1,
+                # λ_relaxation_PH = 1,
+                # λ_relaxation_DR = 1,
+                # linear_viscosity = true,
+                # viscosity_relaxation = 1.0e-2,
                 viscosity_cutoff = cutoff_visc,
             )
         )
@@ -388,10 +456,19 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
         WENO_advection!(T_WENO, (Vx_c, Vy_c), weno, di, dt)
         @views thermal.T[2:(end - 1), 2:(end - 1)] .= T_WENO
 
+        # Sill and host are a partition of the domain, so advect only the sill
+        # marker and take the host as its complement. Advecting both independently
+        # lets WENO over/undershoots drain a cell of both markers, making their sum
+        # zero and the phase-ratio normalization divide by zero.
         WENO_advection!(phase_sill, (Vx_c, Vy_c), weno, di, dt)
-        WENO_advection!(phase_host, (Vx_c, Vy_c), weno, di, dt)
+        clamp!(phase_sill, 0.0, 1.0)
+        phase_host .= 1.0 .- phase_sill
 
         WENO_advection!(d18O, (Vx_c, Vy_c), weno, di, dt)
+
+        # Bulk water travels with the magma; it is conserved (gas stays in-cell).
+        WENO_advection!(mH2O, (Vx_c, Vy_c), weno, di, dt)
+        clamp!(mH2O, 0.0, 1.0)
 
         thermal.ΔT .= thermal.T .- thermal.Told
 
@@ -403,16 +480,47 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
 
         update_phase_ratios_2D!(phase_ratios, (phase_host, phase_sill), xci, xvi)
 
-        compute_melt_fraction!(ϕ, phase_ratios, rheology, (T=thermal.T, P=stokes.P))
+        compute_melt_fraction!(ϕ, phase_ratios, rheology, (T=thermal.T, P=stokes.P, mH2O = mH2O_melt))
+
+        # --- Volatile partitioning & three-phase density coupling ---------------
+        # Solubility per melt mass at the current P,T:
+        compute_dissolved_volatiles!(mH2O_diss, mCO2_diss, phase_ratios, rheology, (; thermal.T, stokes.P, X_co2))
+
+        ϵϕ = 1.0e-6
+        # Water actually dissolved in the melt (per melt mass), capped at solubility,
+        # and the bulk excess that exsolves as gas (bulk capacity = solubility*ϕ).
+        @. mH2O_melt = min(mH2O / max(ϕ, ϵϕ), mH2O_diss)
+        @. mH2O_exs  = max(mH2O - mH2O_diss * ϕ, 0.0)
+
+        # Convert exsolved gas mass fraction to a volume fraction. ρ_gas from the
+        # H2O EOS at P,T; the condensed density is the current mixture density
+        # (lagged, gas fraction small). ϕ_gas and ϕ_x feed next step's density.
+        @. ρ_gas = _ρgas(stokes.P, T_WENO)
+        ρ_cond = ρg[end] ./ 9.81
+        @. ϕ_gas = (mH2O_exs / ρ_gas) / (mH2O_exs / ρ_gas + (1 - mH2O_exs) / ρ_cond)
+        @. ϕ_x   = (1 - ϕ) * (1 - ϕ_gas)
 
         @show it += 1
         t        += dt
         push!(time_vec, t)
         push!(d18O_evo, round(mean(d18O[ϕ .> 0.2]), digits=2))
         push!(melt_fraction_evo, round(maximum(ϕ), digits=2))
+        push!(viscosity_evo, mean(stokes.viscosity.η[ϕ .> 0.2]))
+        push!(mH2O_diss_evo, mean(mH2O_diss[ϕ .> 0.2]))
+        push!(mH2O_exs_evo, mean(mH2O_exs[ϕ .> 0.2]))
+
+        # Temperature snapshot, taken as t crosses each target time
+        if !isempty(snapshot_targets) && t >= snapshot_targets[1]
+            target = popfirst!(snapshot_targets)
+            fname  = joinpath(figdir, "snapshot_$(round(Int, target))_$(nx)x$(ny).jld2")
+            checkpointing_jld2(
+                figdir, stokes, thermal, t, dt, fname;
+                T = Array(thermal.T[2:(end - 1), 2:(end - 1)]) .- 273.15, xci = Array.(xci)
+            )
+        end
 
         # Data I/O and plotting ---------------------
-        if it == 1 || rem(it, 1) == 0
+        if it == 1 || rem(it, 10) == 0
             if igg.me == 0 && it == 1
                 metadata(pwd(), checkpoint, joinpath(@__DIR__, "SillConvection.jl"), joinpath(@__DIR__, "SillRheology.jl"))
             end
@@ -438,6 +546,10 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
                     viscosity = Array(η),
                     phases = [argmax(p) for p in Array(phase_ratios.center)],
                     Melt_fraction = Array(ϕ),
+                    mH2O_bulk = Array(mH2O),
+                    mH2O_dissolved = Array(mH2O_diss),
+                    mH2O_exsolved = Array(mH2O_exs),
+                    phi_gas = Array(ϕ_gas),
                     EII_pl = Array(stokes.EII_pl),
                     stress_II = Array(stokes.τ.II),
                     strain_rate_II = Array(stokes.ε.II),
@@ -545,7 +657,7 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
                 xci...,
                 Array(ϕ);
                 colormap=:lipari,
-                levels=0:0.1:1.0,
+                levels=0.0:0.1:1.0,
             )
 
             hidexdecorations!(ax1)
@@ -754,6 +866,12 @@ function main(li, origin, igg; nx = 64, ny =64, figdir="SillConvection2D", do_vt
 
     end
 
+    checkpointing_jld2(
+        figdir, stokes, thermal, t, dt, joinpath(figdir, "final_$(nx)x$(ny).jld2");
+        time_vec = time_vec, viscosity_evo = viscosity_evo,
+        mH2O_diss_evo = mH2O_diss_evo, mH2O_exs_evo = mH2O_exs_evo,
+    )
+
     return nothing
 end
 ## END OF MAIN SCRIPT ----------------------------------------------------------------
@@ -761,15 +879,16 @@ const plotting = true
 do_vtk = true
 
 # (Path)/folder where output data and figures are stored
-figdir   = "PD_LARGE__SillConvection2D_$(today())"
-n = 128
+# figdir   = "PD_LARGE__SillConvection2D_$(today())"
+figdir   = "GMD_test_run_$(today())"
+n = 256
 nx, ny = n, n
 
-sill_temp = 1273.15 # in K
-host_rock_temp = 500.0 + 273.15 # in C
+sill_temp = 1173.15 # in K
+host_rock_temp = 600.0 + 273.15 # in C
 sill_size = 100.0 # in m
 depth = 5e3 # in m
-li = dimensions = (300.0, 200.0) # in m
+li = dimensions = (200.0, 150.0) # in m
 origin = (0.0, -li[2])
 igg = if !(JustRelax.MPI.Initialized())
     IGG(init_global_grid(nx, ny, 1; init_MPI=true)...)
@@ -778,4 +897,4 @@ else
 end
 
 # run main script
-main(li, origin, igg; nx = nx, ny = ny, figdir = figdir, do_vtk = do_vtk, cutoff_visc = (1e1, 1.0e16), plotting = plotting, sill_temp = sill_temp, host_rock_temp = host_rock_temp, sill_size = sill_size, depth = depth);
+main(li, origin, igg; nx = nx, ny = ny, figdir = figdir, do_vtk = do_vtk, cutoff_visc = (1e3, 1.0e16), plotting = plotting, sill_temp = sill_temp, host_rock_temp = host_rock_temp, sill_size = sill_size, depth = depth);
