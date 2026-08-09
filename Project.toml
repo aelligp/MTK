@@ -1,7 +1,7 @@
 name = "JustCollapse"
 uuid = "59045a92-8ed8-4530-b619-5b4fcaaad30c"
-authors = ["Pascal Aellig <paellig@uni-mainz.de>, Albert De Montserrat <albertdemontserratnavarro@erdw.ethz.ch>"]
 version = "0.1.0"
+authors = ["Pascal Aellig <paellig@uni-mainz.de>, Albert De Montserrat <albertdemontserratnavarro@erdw.ethz.ch>"]
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -48,7 +48,7 @@ JLD2 = "0.4, 0.5, 0.6"
 JustPIC = "0.3.6, 0.4, 0.5"
 JustRelax = "0.3, 0.4"
 MAT = "0.10.7"
-ParallelStencil = "0.13, 0.14"
+ParallelStencil = "0.13, 0.14, 0.15"
 StaticArrays = "1"
 Statistics = "1"
 WriteVTK = "1.18, 1.19"
